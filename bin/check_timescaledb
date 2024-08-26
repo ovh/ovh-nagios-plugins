@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+import re
+
+import nagiosplugin
+
+logger = logging.getLogger(__name__)
+
+try:
+    import psycopg2
+
+    HAS_PSYCOPG = True
+except ModuleNotFoundError:
+    HAS_PSYCOPG = False
+
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ModuleNotFoundError:
+    HAS_PSUTIL = False
+
+try:
+    from functools import cached_property
+except ImportError:
+    cached_property = property
+
+
+class BooleanContext(nagiosplugin.Context):
+    """Return CRITICAL if a boolean (true or false) doesn't have the expected value"""
+
+    def __init__(self, name, level, expected=True):
+        super().__init__(name)
+        self.level = level
+        self.expected = expected
+
+    def evaluate(self, metric, resource):
+        if metric.value is self.expected:
+            state = nagiosplugin.state.Ok
+        else:
+            state = self.level
+        return self.result_cls(state, metric.name, metric)
+
+
+class Timescaledb(nagiosplugin.Resource):
+    """Nagios resource used to gather metrics from PostgreSQL instance"""
+
+    def __init__(self, command, username, skip_recovery):
+        self.command = command
+        self.metrics = []
+        self.username = username
+        self.skip_recovery = skip_recovery
+        self.db = psycopg2.connect(user=username, dbname="postgres")
+
+    @cached_property
+    def has_timescaledb(self):
+        """Return true if timescaledb is available in the extensions"""
+        with self.db.cursor() as cur:
+            cur.execute(
+                "select count(*) from pg_available_extensions where name = 'timescaledb'"
+            )
+            has_extension = cur.fetchone()[0] == 1
+            if has_extension:
+                logger.debug("Extension detected")
+            return has_extension
+
+    @cached_property
+    def is_in_recovery(self):
+        """Return true if the instance is in recovery"""
+        with self.db.cursor() as cur:
+            cur.execute("select pg_is_in_recovery()")
+            in_recovery = cur.fetchone()[0]
+            if in_recovery:
+                logger.debug("Instance is in recovery")
+            return in_recovery
+
+    @cached_property
+    def databases(self):
+        """List databases"""
+        with self.db.cursor() as cur:
+            cur.execute(
+                "select datname from pg_database where not datistemplate and datallowconn"
+            )
+            databases = sorted(r[0] for r in cur.fetchall())
+            logger.debug(f"Detected databases: {', '.join(databases)}")
+            return databases
+
+    @cached_property
+    def available_version(self):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "select default_version from pg_available_extensions where name = 'timescaledb'"
+            )
+            version = cur.fetchone()[0]
+            logger.debug(f"Available version is {version}")
+            return version
+
+    def installed_version(self, database):
+        """Fetch installed version of TimescaleDB for a database"""
+        with psycopg2.connect(dbname=database, user=self.username) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select extversion from pg_extension where extname = 'timescaledb'"
+                )
+                row = cur.fetchone()
+                if row:
+                    logger.debug(f"Installed version in {database} is {row[0]}")
+                    return row[0]
+
+    def installed(self, database):
+        """Detect if TimescaleDB is installed on a database or not"""
+        return self.installed_version(database=database) is not None
+
+    def check_version(self):
+        """Check available version and compare with installed versions"""
+        if self.skip_recovery and self.is_in_recovery:
+            return [
+                nagiosplugin.Metric(
+                    "PostgreSQL is in recovery", True, context="version"
+                )
+            ]
+
+        if not self.has_timescaledb:
+            return [
+                nagiosplugin.Metric(
+                    "TimescaleDB not available", True, context="version"
+                )
+            ]
+
+        for database in self.databases:
+            installed_version = self.installed_version(database=database)
+            msg = f"{database} ({installed_version})"
+            if installed_version:
+                self.metrics.append(
+                    nagiosplugin.Metric(
+                        msg,
+                        self.available_version == installed_version,
+                        context="version",
+                    )
+                )
+        if not self.metrics:
+            return [
+                nagiosplugin.Metric(
+                    "TimescaleDB not installed", True, context="version"
+                )
+            ]
+        return self.metrics
+
+    def job_errors(self, database):
+        """Fetch number of TimescaleDB jobs in error for a database"""
+        installed = self.installed(database=database)
+        if installed:
+            with psycopg2.connect(dbname=database, user=self.username) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select count(*) from timescaledb_information.job_errors"
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        logger.debug(f"{database} has {row[0]} job in error")
+                        return row[0]
+
+    def check_job_errors(self):
+        """Check if there are job errors"""
+        if self.skip_recovery and self.is_in_recovery:
+            return [
+                nagiosplugin.Metric(
+                    "PostgreSQL is in recovery", 0, context="job_errors"
+                )
+            ]
+
+        if not self.has_timescaledb:
+            return [
+                nagiosplugin.Metric(
+                    "TimescaleDB not available", 0, context="job_errors"
+                )
+            ]
+
+        for database in self.databases:
+            errors = self.job_errors(database=database)
+            if errors is not None:
+                self.metrics.append(
+                    nagiosplugin.Metric(database, errors, context="job_errors")
+                )
+
+        if not self.metrics:
+            return [
+                nagiosplugin.Metric(
+                    "TimescaleDB not installed", 0, context="job_errors"
+                )
+            ]
+
+        return self.metrics
+
+    def check_background_workers(self):
+        """Check if background workers are started"""
+        if self.skip_recovery and self.is_in_recovery:
+            return [
+                nagiosplugin.Metric(
+                    "PostgreSQL is in recovery", True, context="background_workers"
+                )
+            ]
+
+        if not self.has_timescaledb:
+            return [
+                nagiosplugin.Metric(
+                    "TimescaleDB not available", True, context="background_workers"
+                )
+            ]
+
+        # Count TimescaleDB databases
+        timescaledb_databases = sum(
+            1 for db in self.databases if self.installed_version(db)
+        )
+        db_wording = "databases" if timescaledb_databases > 1 else "database"
+
+        # Count background workers
+        background_workers = 0
+        for proc in psutil.process_iter(["cmdline"]):
+            if proc.cmdline():
+                if re.findall(
+                    r"TimescaleDB Background Worker Scheduler", proc.cmdline()[0]
+                ):
+                    background_workers += 1
+
+        bgw_wording = "workers" if background_workers > 1 else "worker"
+
+        msg = (
+            f"{background_workers} background {bgw_wording}",
+            f"for {timescaledb_databases} {db_wording}",
+        )
+
+        return [
+            nagiosplugin.Metric(
+                " ".join(msg),
+                timescaledb_databases <= background_workers,
+                context="background_workers",
+            )
+        ]
+
+    def probe(self):
+        """Gather all metrics"""
+        func_name = f"check_{self.command}"
+        if hasattr(self, func_name) and callable(getattr(self, func_name)):
+            return getattr(self, func_name)()
+
+
+class TimescaledbSummary(nagiosplugin.Summary):
+    """Display results nicely"""
+
+    def problem(self, results):
+        return ", ".join(sorted(str(r) for r in results if not r.metric.value))
+
+    def ok(self, results):
+        return ", ".join(sorted(str(r) for r in results))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        dest="loglevel",
+        action="store_const",
+        const=logging.INFO,
+        help="Print more output",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        dest="loglevel",
+        action="store_const",
+        const=logging.DEBUG,
+        default=logging.WARNING,
+        help="Print even more output",
+    )
+
+    parser.add_argument(
+        "-u",
+        "--username",
+        dest="username",
+        type=str,
+        default=None,
+        help="Username used to connect to PostgreSQL",
+    )
+
+    parser.add_argument(
+        "-r",
+        "--skip-recovery",
+        dest="skip_recovery",
+        action="store_true",
+        help="Do not perform checks when PostgreSQL is in recovery",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    version = subparsers.add_parser(
+        "version", help="Compare available version with installed versions"
+    )
+    version.add_argument(
+        "--warning",
+        dest="level",
+        action="store_const",
+        const=nagiosplugin.state.Warn,
+        default=nagiosplugin.state.Critical,
+        help="Return warning alert instead of critical",
+    )
+
+    job_errors = subparsers.add_parser(
+        "job_errors", help="Check number of errors in jobs"
+    )
+    job_errors.add_argument(
+        "-w",
+        "--warning",
+        dest="warning",
+        type=int,
+        default=1,
+        help="Return warning if job errors exceed this threshold",
+    )
+    job_errors.add_argument(
+        "-c",
+        "--critical",
+        dest="critical",
+        type=int,
+        default=1,
+        help="Return critical if job errors exceed this threshold",
+    )
+
+    background_workers = subparsers.add_parser(
+        "background_workers", help="Ensure background workers are started"
+    )
+    background_workers.add_argument(
+        "--warning",
+        dest="level",
+        action="store_const",
+        const=nagiosplugin.state.Warn,
+        default=nagiosplugin.state.Critical,
+        help="Return warning alert instead of critical",
+    )
+
+    return parser.parse_args()
+
+
+def setup_logging(args):
+    logging.basicConfig(format="%(levelname)s: %(message)s", level=args.loglevel)
+
+
+@nagiosplugin.guarded
+def main():
+    if not HAS_PSYCOPG:
+        raise nagiosplugin.CheckError("psycopg2 is required")
+
+    args = parse_args()
+    setup_logging(args)
+
+    if args.command == "version":
+        context = BooleanContext("version", level=args.level)
+    elif args.command == "job_errors":
+        context = nagiosplugin.ScalarContext("job_errors", args.warning, args.critical)
+    elif args.command == "background_workers":
+        if not HAS_PSUTIL:
+            raise nagiosplugin.CheckError("psutil is required")
+        context = BooleanContext("background_workers", level=args.level)
+    else:
+        raise nagiosplugin.CheckError("Invalid command")
+
+    resource = Timescaledb(
+        command=args.command, username=args.username, skip_recovery=args.skip_recovery
+    )
+    summary = TimescaledbSummary()
+
+    check = nagiosplugin.Check(resource, context, summary)
+    check.main()
+
+
+if __name__ == "__main__":
+    main()

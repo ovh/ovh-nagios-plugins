@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import os
+from datetime import datetime
+
+import nagiosplugin
+import nagiosplugin.state
+
+try:
+    import pymongo
+
+    HAS_PYMONGO = True
+except ModuleNotFoundError:
+    HAS_PYMONGO = False
+
+
+class BooleanContext(nagiosplugin.Context):
+    """Return CRITICAL if a boolean (true or false) doesn't have the expected value"""
+
+    def __init__(self, name, expected=True):
+        super().__init__(name)
+        self.expected = expected
+
+    def evaluate(self, metric, resource):
+        if metric.value is self.expected:
+            state = nagiosplugin.state.Ok
+        else:
+            state = nagiosplugin.state.Critical
+        return self.result_cls(state, metric.name, metric)
+
+
+class Mongodb(nagiosplugin.Resource):
+    """Nagios resource used to gather metrics from MongoDB instance"""
+
+    def __init__(
+        self,
+        command,
+        host,
+        port,
+        username,
+        password,
+        replicaset,
+        cnf,
+        auth_source,
+        auth_mecanism,
+        tls=None,
+        tls_allow_invalid_certificates=None,
+        canary_database=None,
+        canary_collection=None,
+        canary_create=None,
+    ):
+        self.command = command
+        self.host = host
+        self.port = port
+        self.replicaset = replicaset
+        self.cnf = cnf
+        self.auth_source = auth_source
+        self.auth_mecanism = auth_mecanism
+        self.tls = tls
+        self.tls_allow_invalid_certificates = tls_allow_invalid_certificates
+
+        self.canary_database = canary_database
+        self.canary_collection = canary_collection
+        self.canary_create = canary_create
+        self.canary_document = {"_id": 1}
+
+        self.username = username
+        self.password = password
+        if not username and not password:
+            credentials = self.load_cnf()
+            if credentials:
+                self.username = credentials["user"]
+                self.password = credentials["pass"]
+
+        self.connect()
+
+    def load_cnf(self):
+        """
+        Read username and password from INI file
+
+        Example:
+        [client]
+        user = <username>
+        pass = <password>
+        """
+        config = configparser.ConfigParser()
+        try:
+            config.read(os.path.expanduser(self.cnf))
+            return {
+                "user": config.get("client", "user"),
+                "pass": config.get("client", "pass"),
+            }
+        except (configparser.NoOptionError, configparser.NoSectionError, IOError):
+            return {}
+
+    def connect(self):
+        """Connect and authenticate to the MongoDB instance"""
+        connection_args = {
+            "username": self.username,
+            "password": self.password,
+        }
+        if self.auth_mecanism in ["SCRAM-SHA-1", "SCRAM-SHA-256"]:
+            connection_args["authSource"] = self.auth_source
+            connection_args["authMechanism"] = self.auth_mecanism
+        if self.replicaset:
+            connection_args["replicaset"] = self.replicaset
+        if self.tls:
+            connection_args["tls"] = self.tls
+        if self.tls_allow_invalid_certificates:
+            connection_args[
+                "tlsAllowInvalidCertificates"
+            ] = self.tls_allow_invalid_certificates
+        self.db = pymongo.MongoClient(self.host, **connection_args)
+
+    def check_connections(self):
+        """Gather number of current connections"""
+        connections = self.db.admin.command("serverStatus")["connections"]["current"]
+        return [nagiosplugin.Metric("connections", connections, context="connections")]
+
+    @property
+    def repl_set_status(self):
+        """Return Replica Set status"""
+        return self.db.admin.command("replSetGetStatus")
+
+    def check_repl_state(self):
+        """Gather state of replication"""
+        ok = int(self.repl_set_status["ok"]) == 1
+        return [nagiosplugin.Metric("repl_state", ok, context="repl_state")]
+
+    def check_repl_lag(self):
+        """Gather replication lag in seconds"""
+        optime = None
+        highest_optime = None
+        for member in self.repl_set_status["members"]:
+            if member["stateStr"] == "PRIMARY":
+                highest_optime = member["optimeDate"]
+            if member.get("self", False) is True:
+                optime = member["optimeDate"]
+            if optime and highest_optime:
+                break
+
+        if not optime or not highest_optime:
+            raise nagiosplugin.CheckError(
+                "Failed to find current and/or highest optime"
+            )
+
+        repl_lag = (highest_optime - optime).seconds
+
+        return [nagiosplugin.Metric("repl_lag", repl_lag, context="repl_lag")]
+
+    def check_canary_read(self):
+        """Perform findOne query and measure execution time"""
+        for attr in ["canary_database", "canary_collection"]:
+            if not getattr(self, attr):
+                raise AttributeError(f"Missing '{attr}' attribute for canary_read")
+        start = datetime.now()
+        document = self.db[self.canary_database][self.canary_collection].find_one(
+            self.canary_document
+        )
+        delta = datetime.now() - start
+        execution_time_ms = (delta.seconds * 1000) + (delta.microseconds / 1000)
+        if not document and self.canary_create:
+            document = self.db[self.canary_database][self.canary_collection].insert_one(
+                self.canary_document
+            )
+        if not document:
+            raise Exception(
+                "Document not found for canary_read. You should consider using --create argument."
+            )
+        return [
+            nagiosplugin.Metric("canary_read", execution_time_ms, context="canary_read")
+        ]
+
+    def check_canary_write(self):
+        """Perform replace query and measure execution time"""
+        for attr in ["canary_database", "canary_collection"]:
+            if not getattr(self, attr):
+                raise AttributeError(f"Missing '{attr}' attribute for canary_write")
+        start = datetime.now()
+        updated = self.canary_document | {"ts": start}
+        self.db[self.canary_database][self.canary_collection].replace_one(
+            self.canary_document, updated, upsert=True
+        )
+        delta = datetime.now() - start
+        execution_time_ms = (delta.seconds * 1000) + (delta.microseconds / 1000)
+        return [
+            nagiosplugin.Metric(
+                "canary_write", execution_time_ms, context="canary_write"
+            )
+        ]
+
+    def probe(self):
+        """Gather all metrics"""
+        if hasattr(self, f"check_{self.command}") and callable(
+            func := getattr(self, f"check_{self.command}")
+        ):
+            return func()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-H",
+        "--host",
+        type=str,
+        dest="host",
+        default="127.0.0.1",
+        help="Hostname or IP address used to connect to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-P",
+        "--port",
+        type=int,
+        dest="port",
+        default=27017,
+        help="Port used to connect to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-u",
+        "--username",
+        type=str,
+        dest="username",
+        default=None,
+        help="Username used to connect to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-p",
+        "--password",
+        type=str,
+        dest="password",
+        default=None,
+        help="Password used to connect to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-r",
+        "--replicaset",
+        type=str,
+        dest="replicaset",
+        default=None,
+        help="Name of the MongoDB Replica Set to connect",
+    )
+    parser.add_argument(
+        "--tls",
+        dest="tls",
+        action="store_true",
+        help="Enable TLS when connecting to the MongoDB instance",
+    )
+    parser.add_argument(
+        "--tls-allow-invalid-certificates",
+        dest="tls_allow_invalid_certificates",
+        action="store_true",
+        help="Allow invalid TLS certificates when connecting to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-f",
+        "--cnf",
+        type=str,
+        dest="cnf",
+        default=".mongodb.cnf",
+        help="Credentials file used to authenticate to the MongoDB instance (INI format)",
+    )
+    parser.add_argument(
+        "-s",
+        "--auth-source",
+        type=str,
+        dest="auth_source",
+        default="admin",
+        help="Database used to authenticate to the MongoDB instance",
+    )
+    parser.add_argument(
+        "-m",
+        "--auth-mecanism",
+        type=str,
+        dest="auth_mecanism",
+        default="SCRAM-SHA-256",
+        help="Mecanism used to authenticate to the MongoDB instance",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    connections = subparsers.add_parser("connections", help="Check for connections")
+    connections.add_argument(
+        "-w", "--warning", type=int, default=15000, help="Warning threshold"
+    )
+    connections.add_argument(
+        "-c", "--critical", type=int, default=19000, help="Critical threshold"
+    )
+
+    subparsers.add_parser("repl_state", help="Check for replication state")
+
+    repl_lag = subparsers.add_parser("repl_lag", help="Check for replication lag")
+    repl_lag.add_argument(
+        "-w", "--warning", type=int, default=200, help="Warning threshold in seconds"
+    )
+    repl_lag.add_argument(
+        "-c", "--critical", type=int, default=500, help="Critical threshold in seconds"
+    )
+
+    canary_read = subparsers.add_parser(
+        "canary_read", help="Check for read query execution time"
+    )
+    canary_read.add_argument(
+        "-w",
+        "--warning",
+        type=int,
+        default=500,
+        help="Warning threshold in milliseconds",
+    )
+    canary_read.add_argument(
+        "-c",
+        "--critical",
+        type=int,
+        default=1000,
+        help="Critical threshold in milliseconds",
+    )
+    canary_read.add_argument(
+        "-d",
+        "--database",
+        dest="canary_database",
+        default="canary_mongodb",
+        help="Name of the database",
+    )
+    canary_read.add_argument(
+        "-C",
+        "--collection",
+        dest="canary_collection",
+        default="canary_check",
+        help="Name of the collection",
+    )
+    canary_read.add_argument(
+        "-a",
+        "--create",
+        dest="canary_create",
+        action="store_true",
+        help="Create the document if it doesn't exist",
+    )
+
+    canary_write = subparsers.add_parser(
+        "canary_write", help="Check for write query execution time"
+    )
+    canary_write.add_argument(
+        "-w",
+        "--warning",
+        type=int,
+        default=500,
+        help="Warning threshold in milliseconds",
+    )
+    canary_write.add_argument(
+        "-c",
+        "--critical",
+        type=int,
+        default=1000,
+        help="Critical threshold in milliseconds",
+    )
+    canary_write.add_argument(
+        "-d",
+        "--database",
+        dest="canary_database",
+        default="canary_mongodb",
+        help="Name of the database",
+    )
+    canary_write.add_argument(
+        "-C",
+        "--collection",
+        dest="canary_collection",
+        default="canary_check",
+        help="Name of the collection",
+    )
+
+    return parser.parse_args()
+
+
+@nagiosplugin.guarded
+def main():
+    if not HAS_PYMONGO or int(pymongo.version.split(".")[0]) < 4:
+        raise nagiosplugin.CheckError("PyMongo 4+ is required")
+
+    args = parse_args()
+
+    if args.command == "connections":
+        context = nagiosplugin.ScalarContext("connections", args.warning, args.critical)
+    elif args.command == "repl_state":
+        context = BooleanContext("repl_state")
+    elif args.command == "repl_lag":
+        context = nagiosplugin.ScalarContext("repl_lag", args.warning, args.critical)
+    elif args.command == "canary_read":
+        context = nagiosplugin.ScalarContext("canary_read", args.warning, args.critical)
+    elif args.command == "canary_write":
+        context = nagiosplugin.ScalarContext(
+            "canary_write", args.warning, args.critical
+        )
+    else:
+        raise nagiosplugin.CheckError("Invalid command")
+
+    arguments = {
+        "command": args.command,
+        "host": args.host,
+        "port": args.port,
+        "username": args.username,
+        "password": args.password,
+        "replicaset": args.replicaset,
+        "cnf": args.cnf,
+        "auth_source": args.auth_source,
+        "auth_mecanism": args.auth_mecanism,
+    }
+    if args.tls:
+        arguments["tls"] = args.tls
+    if args.tls_allow_invalid_certificates:
+        arguments[
+            "tls_allow_invalid_certificates"
+        ] = args.tls_allow_invalid_certificates
+
+    if args.command in ["canary_read", "canary_write"]:
+        arguments["canary_database"] = args.canary_database
+        arguments["canary_collection"] = args.canary_collection
+    if args.command == "canary_read":
+        arguments["canary_create"] = args.canary_create
+
+    resource = Mongodb(**arguments)
+    summary = nagiosplugin.Summary()
+
+    check = nagiosplugin.Check(resource, context, summary)
+    check.main()
+
+
+if __name__ == "__main__":
+    main()
