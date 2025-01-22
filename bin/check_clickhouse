@@ -5,6 +5,7 @@ import time
 
 import nagiosplugin
 import nagiosplugin.state
+import yaml
 
 try:
     from clickhouse_driver import Client
@@ -90,10 +91,17 @@ class ExtendedSummary(nagiosplugin.Summary):
 class Clickhouse(nagiosplugin.Resource):
     """Nagios resource used to gather metrics from ClickHouse instance"""
 
-    def __init__(self, command, host, port, secure):
+    # default password is ''
+    # https://clickhouse-driver.readthedocs.io/en/latest/api.html#connection
+
+    def __init__(self, command, host, port, secure, user="default", password=""):
         self.command = command
         self.secure = secure
-        self.client = Client(host=host, port=port, secure=secure)
+        self.user = user
+        self.password = password
+        self.client = Client(
+            host=host, port=port, secure=secure, user=user, password=password
+        )
 
     def query(self, query, default=None):
         """Query and return one value or the default value"""
@@ -129,7 +137,13 @@ class Clickhouse(nagiosplugin.Resource):
         for host, port in members:
             value = f"{host}:{port}"
             try:
-                client = Client(host=host, port=port, secure=self.secure)
+                client = Client(
+                    host=host,
+                    port=port,
+                    secure=self.secure,
+                    user=self.user,
+                    password=self.password,
+                )
                 client.execute("select 1")
                 result = True
             except Exception as err:
@@ -236,6 +250,12 @@ def parse_args():
         dest="secure",
         action="store_true",
         help="Enable TLS when connecting to the ClickHouse instance",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config",
+        help="Path to a clickhouse-client config file",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -351,6 +371,11 @@ def parse_args():
     return parser.parse_args()
 
 
+def read_config(config_file):
+    with open(config_file, "r") as conf:
+        return yaml.safe_load(conf)
+
+
 @nagiosplugin.guarded
 def main():
     if not HAS_CLICKHOUSE_DRIVER:
@@ -388,12 +413,16 @@ def main():
         port = CH_PORT
         if args.secure:
             port = CH_PORT_TLS
-
+    config = {}
+    if args.config:
+        config = read_config(args.config)
     resource = Clickhouse(
         command=args.command,
         host=args.host,
         port=port,
         secure=args.secure,
+        user=config.get("user", "default"),
+        password=config.get("password", ""),
     )
 
     summary = ExtendedSummary()
