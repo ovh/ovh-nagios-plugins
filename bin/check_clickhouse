@@ -81,8 +81,20 @@ class InvertedScalarContext(nagiosplugin.ScalarContext):
 class ExtendedSummary(nagiosplugin.Summary):
     """Display results with more information than the default Summary"""
 
+    def __init__(self, expected: bool = True):
+        self.expected = expected
+
     def problem(self, results):
-        return ", ".join(sorted(str(r) for r in results if not r.metric.value))
+        return ", ".join(
+            sorted(
+                str(r)
+                for r in results
+                if not isinstance(r.metric.value, bool)
+                or (
+                    isinstance(r.metric.value, bool) and r.metric.value != self.expected
+                )
+            )
+        )
 
     def ok(self, results):
         return ", ".join(sorted(str(r) for r in results))
