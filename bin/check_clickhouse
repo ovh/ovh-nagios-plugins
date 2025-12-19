@@ -214,7 +214,9 @@ class Clickhouse(nagiosplugin.Resource):
         after = self.query(query)
         return [
             nagiosplugin.Metric(
-                "pending files rate", after - before, context="pending_files_rate"
+                "pending files rate",
+                max(after - before, 0),
+                context="pending_files_rate",
             )
         ]
 
