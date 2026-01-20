@@ -44,6 +44,27 @@ class BooleanContext(nagiosplugin.Context):
         return self.result_cls(state, metric.name, metric)
 
 
+class ThresholdContext(nagiosplugin.Context):
+    """Trigger alerts when value reaches or exceeds thresholds"""
+
+    def __init__(self, name, warning, critical):
+        super().__init__(name)
+        self.warning = warning
+        self.critical = critical
+
+    def evaluate(self, metric, resource):
+        if metric.value >= self.critical:
+            state = nagiosplugin.state.Critical
+        elif metric.value >= self.warning:
+            state = nagiosplugin.state.Warn
+        else:
+            state = nagiosplugin.state.Ok
+        return self.result_cls(state, metric.name, metric)
+
+    def performance(self, metric, resource):
+        return f"{metric.name}={metric.value};{self.warning};{self.critical}"
+
+
 class Timescaledb(nagiosplugin.Resource):
     """Nagios resource used to gather metrics from PostgreSQL instance"""
 
@@ -359,7 +380,7 @@ def main():
     if args.command == "version":
         context = BooleanContext("version", level=args.level)
     elif args.command == "job_errors":
-        context = nagiosplugin.ScalarContext("job_errors", args.warning, args.critical)
+        context = ThresholdContext("job_errors", args.warning, args.critical)
     elif args.command == "background_workers":
         if not HAS_PSUTIL:
             raise nagiosplugin.CheckError("psutil is required")
