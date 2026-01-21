@@ -17,6 +17,8 @@ Check the number of TimescaleDB jobs in error.
 command[check_timescaledb_job_errors]=/opt/ovh-nagios-plugins/bin/check_timescaledb --skip-recovery --user monitoring job_errors
 ```
 
+The monitoring user should have permissions to list TimescaleDB jobs.
+
 ## version
 
 Compare TimescaleDB extensions installed versions on every databases with the

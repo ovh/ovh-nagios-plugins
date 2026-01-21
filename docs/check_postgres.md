@@ -15,3 +15,5 @@ Check the number of invalid indices on all databases.
 ```
 command[check_postgres_invalid_indices]=/opt/ovh-nagios-plugins/bin/check_postgres --skip-recovery --user monitoring invalid_indices
 ```
+
+The monitoring user should have permissions to list indices.
