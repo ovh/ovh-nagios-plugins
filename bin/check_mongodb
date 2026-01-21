@@ -109,9 +109,9 @@ class Mongodb(nagiosplugin.Resource):
         if self.tls:
             connection_args["tls"] = self.tls
         if self.tls_allow_invalid_certificates:
-            connection_args[
-                "tlsAllowInvalidCertificates"
-            ] = self.tls_allow_invalid_certificates
+            connection_args["tlsAllowInvalidCertificates"] = (
+                self.tls_allow_invalid_certificates
+            )
         self.db = pymongo.MongoClient(self.host, **connection_args)
 
     def check_connections(self):
@@ -409,9 +409,9 @@ def main():
     if args.tls:
         arguments["tls"] = args.tls
     if args.tls_allow_invalid_certificates:
-        arguments[
-            "tls_allow_invalid_certificates"
-        ] = args.tls_allow_invalid_certificates
+        arguments["tls_allow_invalid_certificates"] = (
+            args.tls_allow_invalid_certificates
+        )
 
     if args.command in ["canary_read", "canary_write"]:
         arguments["canary_database"] = args.canary_database
