@@ -78,26 +78,20 @@ class InvertedScalarContext(nagiosplugin.ScalarContext):
         self.critical = nagiosplugin.Range(f"@{critical}")
 
 
-class ExtendedSummary(nagiosplugin.Summary):
-    """Display results with more information than the default Summary"""
-
-    def __init__(self, expected: bool = True):
-        self.expected = expected
+class Summary(nagiosplugin.Summary):
+    """Display results nicely"""
 
     def problem(self, results):
         return ", ".join(
             sorted(
-                str(r)
+                f"{r} ({r.metric.value})"
                 for r in results
-                if not isinstance(r.metric.value, bool)
-                or (
-                    isinstance(r.metric.value, bool) and r.metric.value != self.expected
-                )
+                if r.state != nagiosplugin.state.Ok
             )
         )
 
     def ok(self, results):
-        return ", ".join(sorted(str(r) for r in results))
+        return ", ".join(sorted(f"{r} ({r.metric.value})" for r in results))
 
 
 class Clickhouse(nagiosplugin.Resource):
@@ -439,7 +433,7 @@ def main():
         password=config.get("password", ""),
     )
 
-    summary = ExtendedSummary()
+    summary = Summary()
 
     check = nagiosplugin.Check(resource, context, summary)
     check.main()

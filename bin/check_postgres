@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+
+import nagiosplugin
+
+logger = logging.getLogger(__name__)
+
+try:
+    import psycopg2
+
+    HAS_PSYCOPG = True
+except ModuleNotFoundError:
+    HAS_PSYCOPG = False
+
+try:
+    from functools import cached_property
+except ImportError:
+    cached_property = property
+
+
+class BooleanContext(nagiosplugin.Context):
+    """
+    Check if a boolean has the expected value (default True)
+    Return nagios state (default CRITICAL)
+    """
+
+    def __init__(self, name, warning=False, expected=True):
+        super().__init__(name)
+        self.expected = expected
+        self.warning = warning
+
+    def evaluate(self, metric, resource):
+        if metric.value is self.expected:
+            state = nagiosplugin.state.Ok
+        elif self.warning:
+            state = nagiosplugin.state.Warn
+        else:
+            state = nagiosplugin.state.Critical
+        return self.result_cls(state, metric.name, metric)
+
+
+class ThresholdContext(nagiosplugin.Context):
+    """Trigger alerts when value reaches or exceeds thresholds"""
+
+    def __init__(self, name, warning, critical):
+        super().__init__(name)
+        self.warning = warning
+        self.critical = critical
+
+    def evaluate(self, metric, resource):
+        if metric.value >= self.critical:
+            state = nagiosplugin.state.Critical
+        elif metric.value >= self.warning:
+            state = nagiosplugin.state.Warn
+        else:
+            state = nagiosplugin.state.Ok
+        return self.result_cls(state, metric.name, metric)
+
+    def performance(self, metric, resource):
+        return f"{metric.name}={metric.value};{self.warning};{self.critical}"
+
+
+class Summary(nagiosplugin.Summary):
+    """Display results nicely"""
+
+    def problem(self, results):
+        return ", ".join(
+            sorted(
+                f"{r} ({r.metric.value})"
+                for r in results
+                if r.state != nagiosplugin.state.Ok
+            )
+        )
+
+    def ok(self, results):
+        return ", ".join(sorted(f"{r} ({r.metric.value})" for r in results))
+
+
+class Postgresql(nagiosplugin.Resource):
+    """Nagios resource used to gather metrics from PostgreSQL instance"""
+
+    def __init__(self, command, username, skip_recovery):
+        self.command = command
+        self.metrics = []
+        self.username = username
+        self.skip_recovery = skip_recovery
+        self.db = psycopg2.connect(user=username, dbname="postgres")
+
+    def __del__(self):
+        """Disconnect cleanly from the database"""
+        if self.db:
+            self.db.close()
+
+    @cached_property
+    def is_in_recovery(self):
+        """Return true if the instance is in recovery"""
+        with self.db.cursor() as cur:
+            cur.execute("select pg_is_in_recovery()")
+            in_recovery = cur.fetchone()[0]
+            if in_recovery:
+                logger.debug("Instance is in recovery")
+            return in_recovery
+
+    @cached_property
+    def databases(self):
+        """List databases"""
+        with self.db.cursor() as cur:
+            cur.execute(
+                "select datname from pg_database where not datistemplate and datallowconn"
+            )
+            databases = sorted(r[0] for r in cur.fetchall())
+            logger.debug(f"Detected databases: {', '.join(databases)}")
+            return databases
+
+    def check_disabled_databases(self):
+        """Detect if a given database accept connections or not"""
+        if self.skip_recovery and self.is_in_recovery:
+            return [
+                nagiosplugin.Metric(
+                    "PostgreSQL is in recovery", True, context="disabled_databases"
+                )
+            ]
+
+        metrics = []
+        with self.db.cursor() as cur:
+            cur.execute("""
+                select datname, datallowconn
+                from pg_database
+                where not datistemplate order by datname
+            """)
+            rows = cur.fetchall()
+            for row in rows:
+                database, allow = row
+                wording = (
+                    "allows connections" if allow else "does not allow connections"
+                )
+                logger.debug(f"{database} {wording}")
+                metrics.append(
+                    nagiosplugin.Metric(database, allow, context="disabled_databases")
+                )
+        return metrics
+
+    def invalid_indices(self, database):
+        """Fetch number of invalid indices for a database"""
+        with psycopg2.connect(dbname=database, user=self.username) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    select count(*) as result
+                    from pg_index i
+                        join pg_class c on c.oid = i.indexrelid
+                    where not indisvalid
+                """)
+                row = cur.fetchone()
+                if row:
+                    invalid_count = row[0]
+                    wording = "indices" if invalid_count > 1 else "index"
+                    logger.debug(f"{database} has {invalid_count} invalid {wording}")
+                    return invalid_count
+
+    def check_invalid_indices(self):
+        """Check if there are invalid index"""
+        if self.skip_recovery and self.is_in_recovery:
+            return [
+                nagiosplugin.Metric(
+                    "PostgreSQL is in recovery", 0, context="invalid_indices"
+                )
+            ]
+
+        for database in self.databases:
+            errors = self.invalid_indices(database=database)
+            if errors is not None:
+                self.metrics.append(
+                    nagiosplugin.Metric(database, errors, context="invalid_indices")
+                )
+
+        if not self.metrics:
+            return [
+                nagiosplugin.Metric(
+                    "All indices are valid", 0, context="invalid_indices"
+                )
+            ]
+
+        return self.metrics
+
+    def probe(self):
+        """Gather all metrics"""
+        func_name = f"check_{self.command}"
+        if hasattr(self, func_name) and callable(getattr(self, func_name)):
+            return getattr(self, func_name)()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        dest="loglevel",
+        action="store_const",
+        const=logging.INFO,
+        help="Print more output",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        dest="loglevel",
+        action="store_const",
+        const=logging.DEBUG,
+        default=logging.WARNING,
+        help="Print even more output",
+    )
+
+    parser.add_argument(
+        "-u",
+        "--username",
+        dest="username",
+        type=str,
+        default=None,
+        help="Username used to connect to PostgreSQL",
+    )
+
+    parser.add_argument(
+        "-r",
+        "--skip-recovery",
+        dest="skip_recovery",
+        action="store_true",
+        help="Do not perform checks when PostgreSQL is in recovery",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    disabled_databases = subparsers.add_parser(
+        "disabled_databases", help="Check disabled databases"
+    )
+
+    disabled_databases.add_argument(
+        "-w",
+        "--warning",
+        action="store_true",
+        help="Return warning instead of critical",
+    )
+
+    invalid_indices = subparsers.add_parser(
+        "invalid_indices", help="Check number of invalid indices"
+    )
+    invalid_indices.add_argument(
+        "-w",
+        "--warning",
+        dest="warning",
+        type=int,
+        default=1,
+        help="Return warning if invalid indices exceed this threshold",
+    )
+    invalid_indices.add_argument(
+        "-c",
+        "--critical",
+        dest="critical",
+        type=int,
+        default=1,
+        help="Return critical if invalid indices exceed this threshold",
+    )
+
+    return parser.parse_args()
+
+
+def setup_logging(args):
+    logging.basicConfig(format="%(levelname)s: %(message)s", level=args.loglevel)
+
+
+@nagiosplugin.guarded
+def main():
+    if not HAS_PSYCOPG:
+        raise nagiosplugin.CheckError("psycopg2 is required")
+
+    args = parse_args()
+    setup_logging(args)
+
+    if args.command == "disabled_databases":
+        context = BooleanContext(
+            "disabled_databases", warning=args.warning, expected=True
+        )
+    elif args.command == "invalid_indices":
+        context = ThresholdContext("invalid_indices", args.warning, args.critical)
+    else:
+        raise nagiosplugin.CheckError("Invalid command")
+
+    resource = Postgresql(
+        command=args.command, username=args.username, skip_recovery=args.skip_recovery
+    )
+    summary = Summary()
+
+    check = nagiosplugin.Check(resource, context, summary)
+    check.main()
+
+
+if __name__ == "__main__":
+    main()
