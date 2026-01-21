@@ -268,14 +268,20 @@ class Timescaledb(nagiosplugin.Resource):
             return getattr(self, func_name)()
 
 
-class TimescaledbSummary(nagiosplugin.Summary):
+class Summary(nagiosplugin.Summary):
     """Display results nicely"""
 
     def problem(self, results):
-        return ", ".join(sorted(str(r) for r in results if not r.metric.value))
+        return ", ".join(
+            sorted(
+                f"{r} ({r.metric.value})"
+                for r in results
+                if r.state != nagiosplugin.state.Ok
+            )
+        )
 
     def ok(self, results):
-        return ", ".join(sorted(str(r) for r in results))
+        return ", ".join(sorted(f"{r} ({r.metric.value})" for r in results))
 
 
 def parse_args():
@@ -391,7 +397,7 @@ def main():
     resource = Timescaledb(
         command=args.command, username=args.username, skip_recovery=args.skip_recovery
     )
-    summary = TimescaledbSummary()
+    summary = Summary()
 
     check = nagiosplugin.Check(resource, context, summary)
     check.main()
