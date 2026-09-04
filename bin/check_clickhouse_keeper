@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+import socket
+import ssl
+
+import nagiosplugin
+import nagiosplugin.state
+
+# Default variables
+CH_KEEPER_HOST = "127.0.0.1"
+CH_KEEPER_PORT = 9181
+CONNECTION_TIMEOUT = 5.0
+
+
+class BooleanContext(nagiosplugin.Context):
+    """
+    Check if a boolean has the expected value (default True)
+    Return nagios state (default CRITICAL)
+    """
+
+    def __init__(self, name, warning=False, expected=True):
+        super().__init__(name)
+        self.expected = expected
+        self.warning = warning
+
+    def evaluate(self, metric, resource):
+        if metric.value is self.expected:
+            state = nagiosplugin.state.Ok
+        elif self.warning:
+            state = nagiosplugin.state.Warn
+        else:
+            state = nagiosplugin.state.Critical
+        return self.result_cls(state, metric.name, metric)
+
+
+class Summary(nagiosplugin.Summary):
+    """Display results nicely"""
+
+    def problem(self, results):
+        return ", ".join(
+            sorted(
+                f"{r} ({r.metric.value})"
+                for r in results
+                if r.state != nagiosplugin.state.Ok
+            )
+        )
+
+    def ok(self, results):
+        return ", ".join(sorted(f"{r} ({r.metric.value})" for r in results))
+
+
+class ClickhouseKeeper(nagiosplugin.Resource):
+    """Nagios resource used to gather metrics from ClickHouse Keeper instance"""
+
+    def __init__(self, command, host, port, secure, cafile):
+        self.command = command
+        self.secure = secure
+        if self.secure:
+            context = ssl.create_default_context(cafile=cafile)
+            context.check_hostname = False
+            sock = socket.create_connection((host, port), timeout=CONNECTION_TIMEOUT)
+            self.client = context.wrap_socket(sock, server_hostname=host)
+        else:
+            self.client = socket.create_connection(
+                (host, port), timeout=CONNECTION_TIMEOUT
+            )
+
+    def query(self, query, default=None):
+        """Query and return value or the default value"""
+        self.client.sendall(query.encode())
+        chunks = []
+        while True:
+            data = self.client.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        result = b"".join(chunks).decode("utf-8", "replace")
+        if not result:
+            return default
+        return result
+
+    def probe(self):
+        """Gather all metrics"""
+        if hasattr(self, f"check_{self.command}") and callable(
+            func := getattr(self, f"check_{self.command}")
+        ):
+            return func()
+
+    def check_ok(self):
+        try:
+            value = "ok"
+            response = self.query("ruok")
+            result = response.strip() == "imok"
+        except Exception as err:
+            value = str(err)
+            result = False
+        return [nagiosplugin.Metric(value, result, context="ok")]
+
+    def check_mode(self):
+        try:
+            value = "mode"
+            response = self.query("stat")
+            result = re.search(r"Mode: (leader|follower)", response) is not None
+        except Exception as err:
+            value = str(err)
+            result = False
+        return [nagiosplugin.Metric(value, result, context="mode")]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-H",
+        "--host",
+        type=str,
+        dest="host",
+        default=CH_KEEPER_HOST,
+        help="Hostname or IP address used to connect to the ClickHouse Keeper instance",
+    )
+    parser.add_argument(
+        "-P",
+        "--port",
+        type=int,
+        dest="port",
+        help="Port used to connect to the ClickHouse Keeper instance",
+        required=False,
+    )
+    parser.add_argument(
+        "--secure",
+        dest="secure",
+        action="store_true",
+        help="Enable TLS when connecting to the ClickHouse Keeper instance",
+    )
+    parser.add_argument(
+        "--ca-file",
+        type=str,
+        dest="ca_file",
+        help="CA file used to connect to the ClickHouse Keeper instance",
+        required=False,
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    ok = subparsers.add_parser("ok", help="Check if keeper ok")
+    ok.add_argument(
+        "-w",
+        "--warning",
+        action="store_true",
+        help="Return warning instead of critical",
+    )
+
+    mode = subparsers.add_parser("mode", help="Check if keeper mode is leader/follower")
+    mode.add_argument(
+        "-w",
+        "--warning",
+        action="store_true",
+        help="Return warning instead of critical",
+    )
+
+    return parser.parse_args()
+
+
+@nagiosplugin.guarded
+def main():
+    args = parse_args()
+
+    if args.command == "ok":
+        context = BooleanContext("ok", warning=args.warning)
+    elif args.command == "mode":
+        context = BooleanContext("mode", warning=args.warning)
+    else:
+        raise nagiosplugin.CheckError("Invalid command")
+
+    port = args.port
+    if not port:
+        port = CH_KEEPER_PORT
+    resource = ClickhouseKeeper(
+        command=args.command,
+        host=args.host,
+        port=port,
+        secure=args.secure,
+        cafile=args.ca_file,
+    )
+
+    summary = Summary()
+
+    check = nagiosplugin.Check(resource, context, summary)
+    check.main()
+
+
+if __name__ == "__main__":
+    main()
